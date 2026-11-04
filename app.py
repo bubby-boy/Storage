@@ -1,3 +1,4 @@
+
 import os
 import re
 import io
@@ -21,46 +22,43 @@ from flask import (
 from werkzeug.utils import secure_filename
 
 
-# ============================================================
+# =========================================================
 # CONFIGURATION
-# ============================================================
+# =========================================================
 
 APP_NAME = "ArchiveVault"
 
-IA_ACCESS_KEY = os.environ.get("IA_ACCESS_KEY", "")
-IA_SECRET_KEY = os.environ.get("IA_SECRET_KEY", "")
+IA_ACCESS_KEY = os.getenv("IA_ACCESS_KEY", "")
+IA_SECRET_KEY = os.getenv("IA_SECRET_KEY", "")
 
-APP_PASSWORD = os.environ.get("APP_PASSWORD", "change-me")
-SECRET_KEY = os.environ.get("SECRET_KEY", "change-this-secret")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "change-me")
+SECRET_KEY = os.getenv("SECRET_KEY", "change-this-secret")
 
-PORT = int(os.environ.get("PORT", "8080"))
+PORT = int(os.getenv("PORT", "8080"))
+MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "2048"))
 
-MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2048"))
+DB_PATH = os.getenv("DB_PATH", "archivevault.db")
 
 app = Flask(__name__)
 app.secret_key = SECRET_KEY
 app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
 
 
-# ============================================================
+# =========================================================
 # DATABASE
-# Automatically falls back if Blitz cannot write to DB_PATH.
-# ============================================================
-
-DB_PATH = os.environ.get("DB_PATH", "archivevault.db")
-
+# =========================================================
 
 def connect_database():
     global DB_PATH
 
     try:
-        parent = os.path.dirname(os.path.abspath(DB_PATH))
-        os.makedirs(parent, exist_ok=True)
+        os.makedirs(
+            os.path.dirname(os.path.abspath(DB_PATH)),
+            exist_ok=True
+        )
 
         con = sqlite3.connect(DB_PATH, timeout=30)
         con.row_factory = sqlite3.Row
-
-        con.execute("PRAGMA journal_mode=WAL")
         return con
 
     except (OSError, sqlite3.Error):
@@ -68,13 +66,12 @@ def connect_database():
 
         con = sqlite3.connect(DB_PATH, timeout=30)
         con.row_factory = sqlite3.Row
-        con.execute("PRAGMA journal_mode=WAL")
-
         return con
 
 
 def init_database():
     with connect_database() as con:
+
         con.execute("""
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,13 +88,15 @@ def init_database():
 init_database()
 
 
-# ============================================================
+# =========================================================
 # AUTHENTICATION
-# ============================================================
+# =========================================================
 
 def login_required(func):
+
     @wraps(func)
     def wrapper(*args, **kwargs):
+
         if not session.get("logged_in"):
             return redirect(url_for("login"))
 
@@ -106,70 +105,50 @@ def login_required(func):
     return wrapper
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-
-    if request.method == "POST":
-
-        password = request.form.get("password", "")
-
-        if APP_PASSWORD and password == APP_PASSWORD:
-
-            session["logged_in"] = True
-
-            return redirect(url_for("home"))
-
-        flash("Incorrect password.")
-
-    return render("login.html", LOGIN_HTML, title="Login")
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return redirect(url_for("login"))
-
-
-# ============================================================
+# =========================================================
 # INTERNET ARCHIVE
-# ============================================================
+# =========================================================
 
 def check_archive_credentials():
 
     if not IA_ACCESS_KEY or not IA_SECRET_KEY:
         raise RuntimeError(
-            "Internet Archive credentials are missing. "
-            "Configure IA_ACCESS_KEY and IA_SECRET_KEY in Blitz."
+            "Missing Internet Archive credentials. "
+            "Set IA_ACCESS_KEY and IA_SECRET_KEY in Blitz."
         )
-
-
-def archive_item(identifier):
-    check_archive_credentials()
-    return ia.get_item(identifier)
 
 
 def archive_metadata(identifier):
 
-    url = (
-        "https://archive.org/metadata/"
-        + quote(identifier, safe="")
+    response = requests.get(
+        "https://archive.org/metadata/" + quote(identifier, safe=""),
+        timeout=60
     )
 
-    response = requests.get(url, timeout=45)
     response.raise_for_status()
 
-    return response.json()
+    data = response.json()
+
+    if not isinstance(data, dict):
+        raise RuntimeError("Invalid Internet Archive response.")
+
+    if data.get("is_dark"):
+        raise RuntimeError("This Internet Archive item is unavailable.")
+
+    return data
 
 
 def get_archive_files(identifier):
 
-    metadata = archive_metadata(identifier)
+    check_archive_credentials()
+
+    data = archive_metadata(identifier)
 
     files = []
 
-    for item in metadata.get("files", []):
+    for item in data.get("files", []):
 
-        name = item.get("name")
+        name = item.get("name", "")
 
         if not name:
             continue
@@ -190,6 +169,13 @@ def get_archive_files(identifier):
     return sorted(files, key=lambda x: x["name"].lower())
 
 
+def archive_item(identifier):
+
+    check_archive_credentials()
+
+    return ia.get_item(identifier)
+
+
 def upload_archive_file(identifier, filename, local_path, project):
 
     check_archive_credentials()
@@ -202,7 +188,7 @@ def upload_archive_file(identifier, filename, local_path, project):
         "description": project["description"]
     }
 
-    return item.upload(
+    result = item.upload(
         {filename: local_path},
         metadata=metadata,
         access_key=IA_ACCESS_KEY,
@@ -210,10 +196,12 @@ def upload_archive_file(identifier, filename, local_path, project):
         retries=3
     )
 
+    return result
 
-# ============================================================
+
+# =========================================================
 # PROJECT HELPERS
-# ============================================================
+# =========================================================
 
 def clean_identifier(value):
 
@@ -223,9 +211,9 @@ def clean_identifier(value):
         (value or "").strip().lower()
     ).strip("-_")
 
-    if len(value) < 5 or len(value) > 80:
+    if not 5 <= len(value) <= 80:
         raise ValueError(
-            "Project identifiers must be 5–80 characters."
+            "Project identifiers must be between 5 and 80 characters."
         )
 
     return value
@@ -272,13 +260,13 @@ def get_project(identifier):
     return project
 
 
-# ============================================================
-# HTML LAYOUT
-# ============================================================
+# =========================================================
+# DESIGN
+# =========================================================
 
 STYLE = """
 <style>
-* { box-sizing:border-box }
+* {box-sizing:border-box}
 
 body {
     margin:0;
@@ -332,7 +320,6 @@ textarea {
     justify-content:space-between;
     align-items:center;
     margin-bottom:28px;
-    gap:15px;
 }
 
 .logo {
@@ -363,24 +350,13 @@ textarea {
     gap:15px;
 }
 
-.card {
+.card,.panel {
     background:#111b2b;
     border:1px solid #293750;
     padding:19px;
     border-radius:15px;
+    margin-bottom:15px;
     overflow-wrap:anywhere;
-}
-
-.card h3 {
-    margin-top:0;
-}
-
-.panel {
-    background:#111b2b;
-    border:1px solid #293750;
-    padding:20px;
-    border-radius:15px;
-    margin-bottom:20px;
 }
 
 .actions {
@@ -403,6 +379,7 @@ textarea {
 .file-name {
     overflow-wrap:anywhere;
     flex:1;
+    min-width:180px;
 }
 
 .preview {
@@ -423,7 +400,7 @@ audio {
 
 .progress {
     background:#293750;
-    height:8px;
+    height:9px;
     border-radius:20px;
     overflow:hidden;
     margin-top:12px;
@@ -433,6 +410,7 @@ audio {
     height:100%;
     width:0;
     background:#45d6bd;
+    transition:width .15s;
 }
 
 .notice {
@@ -440,6 +418,15 @@ audio {
     padding:13px;
     border-radius:10px;
     margin-bottom:14px;
+    overflow-wrap:anywhere;
+}
+
+.error {
+    background:#4a2029;
+}
+
+.small {
+    font-size:12px;
 }
 
 @media(max-width:600px) {
@@ -450,7 +437,7 @@ audio {
 """
 
 
-def render(name, template, title="ArchiveVault", **context):
+def render_page(template, title="ArchiveVault", **context):
 
     body = render_template_string(template, **context)
 
@@ -462,6 +449,7 @@ def render(name, template, title="ArchiveVault", **context):
         <meta name="viewport" content="width=device-width,initial-scale=1">
         """ + STYLE + """
     </head>
+
     <body>
     <div class="container">
 
@@ -473,9 +461,11 @@ def render(name, template, title="ArchiveVault", **context):
             {% endif %}
         </header>
 
-        {% with messages=get_flashed_messages() %}
-            {% for message in messages %}
-                <div class="notice">{{ message }}</div>
+        {% with messages=get_flashed_messages(with_categories=true) %}
+            {% for category,message in messages %}
+                <div class="notice {{ 'error' if category == 'error' else '' }}">
+                    {{ message }}
+                </div>
             {% endfor %}
         {% endwith %}
 
@@ -493,9 +483,9 @@ def render(name, template, title="ArchiveVault", **context):
     )
 
 
-# ============================================================
-# PAGE TEMPLATES
-# ============================================================
+# =========================================================
+# LOGIN PAGE
+# =========================================================
 
 LOGIN_HTML = """
 <div class="hero">
@@ -513,24 +503,52 @@ LOGIN_HTML = """
 """
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+
+    if request.method == "POST":
+
+        if request.form.get("password", "") == APP_PASSWORD:
+
+            session["logged_in"] = True
+            return redirect(url_for("home"))
+
+        flash("Incorrect password.", "error")
+
+    return render_page(LOGIN_HTML, title="Login")
+
+
+@app.route("/logout")
+def logout():
+
+    session.clear()
+
+    return redirect(url_for("login"))
+
+
+# =========================================================
+# HOME PAGE
+# =========================================================
+
 HOME_HTML = """
 <div class="hero">
+
     <h1>Your projects. Your files.</h1>
 
     <p class="muted">
-        Organize and store your files using Internet Archive.
-        Upload any file type and download your projects whenever
-        you need them.
+        Upload, organize, preview, stream and download
+        your files using Internet Archive storage.
     </p>
 
     <div class="actions">
         <a class="button" href="/new">＋ New project</a>
     </div>
+
 </div>
 
 <input
     id="search"
-    placeholder="Search your projects..."
+    placeholder="Search projects..."
     oninput="filterProjects()"
 >
 
@@ -547,7 +565,7 @@ HOME_HTML = """
 
     <p class="muted">{{ p.description }}</p>
 
-    <div class="muted">{{ p.identifier }}</div>
+    <div class="muted small">{{ p.identifier }}</div>
 
     <div class="actions">
         <a class="button" href="/project/{{ p.identifier }}">
@@ -577,10 +595,30 @@ function filterProjects() {
 """
 
 
+@app.route("/")
+@login_required
+def home():
+
+    with connect_database() as con:
+
+        projects = con.execute(
+            "SELECT * FROM projects ORDER BY created_at DESC"
+        ).fetchall()
+
+    return render_page(
+        HOME_HTML,
+        projects=projects
+    )
+
+
+# =========================================================
+# CREATE PROJECT
+# =========================================================
+
 NEW_HTML = """
 <div class="hero">
     <h1>Create a project</h1>
-    <p class="muted">Create a new storage container.</p>
+    <p class="muted">Create a new ArchiveVault collection.</p>
 </div>
 
 <div class="panel">
@@ -618,6 +656,57 @@ NEW_HTML = """
 """
 
 
+@app.route("/new", methods=["GET", "POST"])
+@login_required
+def new_project():
+
+    if request.method == "POST":
+
+        try:
+
+            title = request.form.get("title", "").strip()
+            identifier = clean_identifier(
+                request.form.get("identifier")
+            )
+
+            if not title:
+                raise ValueError("Project title is required.")
+
+            with connect_database() as con:
+
+                con.execute("""
+                    INSERT INTO projects
+                    (identifier,title,description,category,tags)
+                    VALUES (?,?,?,?,?)
+                """, (
+                    identifier,
+                    title,
+                    request.form.get("description", ""),
+                    request.form.get("category", "Other"),
+                    request.form.get("tags", "")
+                ))
+
+            flash("Project created successfully.")
+
+            return redirect(
+                url_for("project", identifier=identifier)
+            )
+
+        except sqlite3.IntegrityError:
+
+            flash("That identifier already exists.", "error")
+
+        except Exception as e:
+
+            flash(str(e), "error")
+
+    return render_page(NEW_HTML)
+
+
+# =========================================================
+# PROJECT PAGE
+# =========================================================
+
 PROJECT_HTML = """
 <div class="hero">
 
@@ -627,23 +716,23 @@ PROJECT_HTML = """
 
     <p class="muted">{{ project.description }}</p>
 
-    <div class="muted">
-        Internet Archive: {{ project.identifier }}
-    </div>
+    <div class="muted">{{ project.identifier }}</div>
 
     <div class="actions">
+
         <a class="button" href="#upload">＋ Upload files</a>
 
         <a class="button secondary"
            href="/project/{{ project.identifier }}/zip">
-            Download entire project
+            Download project ZIP
         </a>
 
         <a class="button secondary"
            target="_blank"
            href="https://archive.org/details/{{ project.identifier }}">
-            View Archive ↗
+            Open Archive ↗
         </a>
+
     </div>
 
 </div>
@@ -653,23 +742,19 @@ PROJECT_HTML = """
     <h2>Upload anything</h2>
 
     <p class="muted">
-        All file extensions are accepted. Select multiple files
-        or choose a folder. Folder paths are preserved.
+        All file types are accepted. Choose individual files
+        or an entire folder.
     </p>
 
     <form id="uploadForm">
 
-        <input
-            type="file"
-            id="files"
-            name="files"
-            multiple
-            webkitdirectory
-        >
+        <label>Individual files</label>
+        <input type="file" id="files" multiple>
 
-        <div class="actions">
-            <button type="submit">Upload files</button>
-        </div>
+        <label>Entire folder</label>
+        <input type="file" id="folderFiles" multiple webkitdirectory>
+
+        <button type="submit">Upload selected files</button>
 
         <div class="progress">
             <div class="progress-bar" id="bar"></div>
@@ -683,7 +768,20 @@ PROJECT_HTML = """
 
 <div class="panel">
 
-    <h2>Project files ({{ files|length }})</h2>
+    <h2>Project files</h2>
+
+    {% if archive_error %}
+
+        <div class="notice error">
+            <b>Could not retrieve files from Internet Archive.</b>
+            <p>{{ archive_error }}</p>
+        </div>
+
+    {% endif %}
+
+    <p class="muted">
+        {{ files|length }} files found
+    </p>
 
     <input
         id="fileSearch"
@@ -697,6 +795,7 @@ PROJECT_HTML = """
 
         <div class="file-name">
             📄 {{ f.name }}
+            <div class="muted small">{{ f.format }}</div>
         </div>
 
         <span class="muted">
@@ -721,8 +820,12 @@ PROJECT_HTML = """
 
     {% endfor %}
 
-    {% if not files %}
-        <p class="muted">No files uploaded yet.</p>
+    {% if not files and not archive_error %}
+
+        <p class="muted">
+            No files found. Upload your first file above.
+        </p>
+
     {% endif %}
 
 </div>
@@ -735,11 +838,14 @@ form.addEventListener("submit", function(e) {
 
     e.preventDefault();
 
-    const selected = document.getElementById("files").files;
+    const selected = [
+        ...document.getElementById("files").files,
+        ...document.getElementById("folderFiles").files
+    ];
 
     if (!selected.length) {
         document.getElementById("status").textContent =
-            "Choose some files first.";
+            "Choose files first.";
         return;
     }
 
@@ -763,15 +869,13 @@ form.addEventListener("submit", function(e) {
 
         if (e.lengthComputable) {
 
-            const percent = Math.round(
-                e.loaded / e.total * 100
-            );
+            const percent = Math.round(e.loaded / e.total * 100);
 
             document.getElementById("bar").style.width =
                 percent + "%";
 
             document.getElementById("status").textContent =
-                "Uploading: " + percent + "%";
+                "Sending files: " + percent + "%";
 
         }
 
@@ -786,7 +890,7 @@ form.addEventListener("submit", function(e) {
         } catch(e) {}
 
         document.getElementById("status").textContent =
-            result.message || "Upload finished.";
+            result.message || "Upload response received.";
 
         if (xhr.status >= 200 && xhr.status < 300) {
             setTimeout(() => location.reload(), 1500);
@@ -797,7 +901,7 @@ form.addEventListener("submit", function(e) {
     xhr.onerror = function() {
 
         document.getElementById("status").textContent =
-            "Upload failed. Check your connection and server logs.";
+            "Upload failed. Check the server logs.";
 
     };
 
@@ -824,8 +928,197 @@ function filterFiles() {
 """
 
 
+@app.route("/project/<identifier>")
+@login_required
+def project(identifier):
+
+    p = get_project(identifier)
+
+    files = []
+    archive_error = None
+
+    try:
+
+        files = get_archive_files(identifier)
+
+    except Exception as e:
+
+        archive_error = str(e)
+
+    return render_page(
+        PROJECT_HTML,
+        title=p["title"],
+        project=p,
+        files=files,
+        archive_error=archive_error
+    )
+
+
+# =========================================================
+# UPLOAD
+# =========================================================
+
+@app.route("/project/<identifier>/upload", methods=["POST"])
+@login_required
+def upload(identifier):
+
+    project_data = get_project(identifier)
+
+    check_archive_credentials()
+
+    uploads = request.files.getlist("files")
+
+    if not uploads:
+        return jsonify({"message": "No files selected."}), 400
+
+    uploaded = 0
+    errors = []
+
+    for file in uploads:
+
+        if not file.filename:
+            continue
+
+        local_path = None
+
+        try:
+
+            remote_name = clean_remote_path(file.filename)
+
+            suffix = os.path.splitext(remote_name)[1]
+
+            with tempfile.NamedTemporaryFile(
+                delete=False,
+                suffix=suffix
+            ) as temp:
+
+                file.save(temp.name)
+                local_path = temp.name
+
+            upload_archive_file(
+                identifier,
+                remote_name,
+                local_path,
+                project_data
+            )
+
+            uploaded += 1
+
+        except Exception as e:
+
+            errors.append(f"{file.filename}: {str(e)}")
+
+        finally:
+
+            if local_path and os.path.exists(local_path):
+                os.unlink(local_path)
+
+    message = f"Uploaded {uploaded} file(s)."
+
+    if errors:
+        message += " Errors: " + " | ".join(errors[:5])
+
+    return jsonify({
+        "message": message,
+        "uploaded": uploaded,
+        "errors": errors
+    }), 207 if errors else 200
+
+
+# =========================================================
+# STREAM AND DOWNLOAD
+# =========================================================
+
+def archive_response(identifier, name, inline=False):
+
+    url = (
+        f"https://archive.org/download/"
+        f"{quote(identifier, safe='')}/"
+        f"{quote(name, safe='/')}"
+    )
+
+    headers = {}
+
+    if request.headers.get("Range"):
+        headers["Range"] = request.headers["Range"]
+
+    upstream = requests.get(
+        url,
+        headers=headers,
+        stream=True,
+        timeout=(20, 180)
+    )
+
+    if upstream.status_code not in (200, 206):
+
+        status = upstream.status_code
+        upstream.close()
+        abort(status)
+
+    mime = (
+        upstream.headers.get("Content-Type")
+        or mimetypes.guess_type(name)[0]
+        or "application/octet-stream"
+    )
+
+    disposition = "inline" if inline else "attachment"
+
+    safe_name = secure_filename(
+        os.path.basename(name)
+    ) or "download"
+
+    response = Response(
+        upstream.iter_content(chunk_size=256 * 1024),
+        status=upstream.status_code,
+        content_type=mime,
+        direct_passthrough=True
+    )
+
+    response.headers["Content-Disposition"] = (
+        f'{disposition}; filename="{safe_name}"'
+    )
+
+    for header in (
+        "Content-Length",
+        "Content-Range",
+        "Accept-Ranges",
+        "ETag",
+        "Last-Modified"
+    ):
+
+        if header in upstream.headers:
+            response.headers[header] = upstream.headers[header]
+
+    response.call_on_close(upstream.close)
+
+    return response
+
+
+@app.route("/project/<identifier>/stream/<path:name>")
+@login_required
+def stream_file(identifier, name):
+
+    get_project(identifier)
+
+    return archive_response(identifier, name, inline=True)
+
+
+@app.route("/project/<identifier>/download/<path:name>")
+@login_required
+def download_file(identifier, name):
+
+    get_project(identifier)
+
+    return archive_response(identifier, name, inline=False)
+
+
+# =========================================================
+# FILE PREVIEW
+# =========================================================
+
 VIEW_HTML = """
 <div class="actions">
+
     <a class="button secondary"
        href="/project/{{ project.identifier }}">
         ← Back
@@ -835,11 +1128,15 @@ VIEW_HTML = """
        href="/project/{{ project.identifier }}/download/{{ name|urlencode }}">
         Download original
     </a>
+
 </div>
 
 <div class="hero">
+
     <h1>{{ name }}</h1>
+
     <p class="muted">{{ mime }}</p>
+
 </div>
 
 <div class="panel">
@@ -887,8 +1184,7 @@ VIEW_HTML = """
     <h2>Preview unavailable</h2>
 
     <p class="muted">
-        This file is supported for downloading, but this browser
-        cannot display its contents.
+        This format can still be downloaded.
     </p>
 
     <a class="button"
@@ -902,274 +1198,6 @@ VIEW_HTML = """
 """
 
 
-# ============================================================
-# HOME
-# ============================================================
-
-@app.route("/")
-@login_required
-def home():
-
-    with connect_database() as con:
-
-        projects = con.execute(
-            "SELECT * FROM projects ORDER BY created_at DESC"
-        ).fetchall()
-
-    return render(
-        "home.html",
-        HOME_HTML,
-        projects=projects
-    )
-
-
-# ============================================================
-# CREATE PROJECT
-# ============================================================
-
-@app.route("/new", methods=["GET", "POST"])
-@login_required
-def new_project():
-
-    if request.method == "POST":
-
-        try:
-
-            title = request.form.get("title", "").strip()
-
-            identifier = clean_identifier(
-                request.form.get("identifier")
-            )
-
-            if not title:
-                raise ValueError("Project title is required.")
-
-            with connect_database() as con:
-
-                con.execute("""
-                    INSERT INTO projects
-                    (identifier,title,description,category,tags)
-                    VALUES (?,?,?,?,?)
-                """, (
-                    identifier,
-                    title,
-                    request.form.get("description", ""),
-                    request.form.get("category", "Other"),
-                    request.form.get("tags", "")
-                ))
-
-            flash("Project created successfully.")
-
-            return redirect(
-                url_for("project", identifier=identifier)
-            )
-
-        except sqlite3.IntegrityError:
-
-            flash("That identifier is already in your library.")
-
-        except Exception as e:
-
-            flash(str(e))
-
-    return render("new.html", NEW_HTML)
-
-
-# ============================================================
-# PROJECT PAGE
-# ============================================================
-
-@app.route("/project/<identifier>")
-@login_required
-def project(identifier):
-
-    p = get_project(identifier)
-
-    try:
-
-        files = get_archive_files(identifier)
-
-    except Exception as e:
-
-        files = []
-
-        flash("Archive listing error: " + str(e))
-
-    return render(
-        "project.html",
-        PROJECT_HTML,
-        project=p,
-        files=files
-    )
-
-
-# ============================================================
-# UPLOAD ANY FILE TYPE
-# ============================================================
-
-@app.route("/project/<identifier>/upload", methods=["POST"])
-@login_required
-def upload(identifier):
-
-    project_data = get_project(identifier)
-
-    check_archive_credentials()
-
-    uploads = request.files.getlist("files")
-
-    if not uploads:
-        return jsonify({
-            "message": "No files selected."
-        }), 400
-
-    uploaded = 0
-    errors = []
-
-    for file in uploads:
-
-        if not file.filename:
-            continue
-
-        local_path = None
-
-        try:
-
-            # Preserve folder paths from browser folder selection.
-            remote_name = clean_remote_path(file.filename)
-
-            suffix = os.path.splitext(remote_name)[1]
-
-            with tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix=suffix
-            ) as temp:
-
-                file.save(temp.name)
-                local_path = temp.name
-
-            upload_archive_file(
-                identifier,
-                remote_name,
-                local_path,
-                project_data
-            )
-
-            uploaded += 1
-
-        except Exception as e:
-
-            errors.append(
-                f"{file.filename}: {str(e)}"
-            )
-
-        finally:
-
-            if local_path and os.path.exists(local_path):
-                os.unlink(local_path)
-
-    message = f"Uploaded {uploaded} file(s)."
-
-    if errors:
-        message += " Some uploads failed: " + " | ".join(errors[:4])
-
-    return jsonify({
-        "message": message,
-        "uploaded": uploaded,
-        "errors": errors
-    }), 207 if errors else 200
-
-
-# ============================================================
-# STREAM / DOWNLOAD PROXY
-# Supports HTTP Range requests when the upstream supports them.
-# ============================================================
-
-def archive_response(identifier, name, inline=False):
-
-    url = (
-        f"https://archive.org/download/"
-        f"{quote(identifier, safe='')}/"
-        f"{quote(name, safe='/')}"
-    )
-
-    headers = {}
-
-    if request.headers.get("Range"):
-        headers["Range"] = request.headers["Range"]
-
-    upstream = requests.get(
-        url,
-        headers=headers,
-        stream=True,
-        timeout=(20, 180)
-    )
-
-    if upstream.status_code not in (200, 206):
-
-        status = upstream.status_code
-        upstream.close()
-
-        abort(status)
-
-    mime = (
-        upstream.headers.get("Content-Type")
-        or mimetypes.guess_type(name)[0]
-        or "application/octet-stream"
-    )
-
-    disposition = "inline" if inline else "attachment"
-
-    safe_name = secure_filename(os.path.basename(name)) or "download"
-
-    response = Response(
-        upstream.iter_content(chunk_size=256 * 1024),
-        status=upstream.status_code,
-        content_type=mime,
-        direct_passthrough=True
-    )
-
-    response.headers["Content-Disposition"] = (
-        f'{disposition}; filename="{safe_name}"'
-    )
-
-    for header in (
-        "Content-Length",
-        "Content-Range",
-        "Accept-Ranges",
-        "ETag",
-        "Last-Modified"
-    ):
-
-        if header in upstream.headers:
-            response.headers[header] = upstream.headers[header]
-
-    response.call_on_close(upstream.close)
-
-    return response
-
-
-@app.route("/project/<identifier>/stream/<path:name>")
-@login_required
-def stream_file(identifier, name):
-
-    get_project(identifier)
-
-    return archive_response(identifier, name, inline=True)
-
-
-@app.route("/project/<identifier>/download/<path:name>")
-@login_required
-def download_file(identifier, name):
-
-    get_project(identifier)
-
-    return archive_response(identifier, name, inline=False)
-
-
-# ============================================================
-# FILE PREVIEW AND EDITOR
-# ============================================================
-
 @app.route("/project/<identifier>/view/<path:name>")
 @login_required
 def view_file(identifier, name):
@@ -1177,7 +1205,6 @@ def view_file(identifier, name):
     p = get_project(identifier)
 
     mime = mimetypes.guess_type(name)[0] or "application/octet-stream"
-
     ext = os.path.splitext(name)[1].lower()
 
     if mime.startswith("image/"):
@@ -1223,8 +1250,7 @@ def view_file(identifier, name):
             errors="replace"
         )
 
-    return render(
-        "view.html",
+    return render_page(
         VIEW_HTML,
         title=name,
         project=p,
@@ -1240,9 +1266,9 @@ def view_file(identifier, name):
     )
 
 
-# ============================================================
+# =========================================================
 # EDIT TEXT FILES
-# ============================================================
+# =========================================================
 
 @app.route(
     "/project/<identifier>/edit/<path:name>",
@@ -1259,7 +1285,7 @@ def edit_file(identifier, name):
 
     if len(content.encode("utf-8")) > 2_000_000:
 
-        flash("Text editor limit is 2 MB.")
+        flash("Text editor limit is 2 MB.", "error")
 
         return redirect(
             url_for(
@@ -1293,7 +1319,7 @@ def edit_file(identifier, name):
 
     except Exception as e:
 
-        flash("Save failed: " + str(e))
+        flash("Save failed: " + str(e), "error")
 
     finally:
 
@@ -1309,9 +1335,9 @@ def edit_file(identifier, name):
     )
 
 
-# ============================================================
-# DOWNLOAD ENTIRE PROJECT AS ZIP
-# ============================================================
+# =========================================================
+# PROJECT ZIP DOWNLOAD
+# =========================================================
 
 @app.route("/project/<identifier>/zip")
 @login_required
@@ -1323,7 +1349,7 @@ def project_zip(identifier):
 
     if not files:
 
-        flash("There are no files to download.")
+        flash("No files are available to download.", "error")
 
         return redirect(
             url_for("project", identifier=identifier)
@@ -1365,9 +1391,7 @@ def project_zip(identifier):
 
                 with archive.open(remote_name, "w") as output:
 
-                    for chunk in response.iter_content(
-                        chunk_size=256 * 1024
-                    ):
+                    for chunk in response.iter_content(256 * 1024):
 
                         if chunk:
                             output.write(chunk)
@@ -1395,9 +1419,9 @@ def project_zip(identifier):
         raise
 
 
-# ============================================================
+# =========================================================
 # HEALTH CHECK
-# ============================================================
+# =========================================================
 
 @app.route("/health")
 def health():
@@ -1410,7 +1434,10 @@ def health():
         return jsonify({
             "status": "healthy",
             "application": APP_NAME,
-            "database": "connected"
+            "database": "connected",
+            "archive_credentials_configured": bool(
+                IA_ACCESS_KEY and IA_SECRET_KEY
+            )
         })
 
     except Exception as e:
@@ -1421,29 +1448,19 @@ def health():
         }), 500
 
 
-# ============================================================
-# ERROR HANDLERS
-# ============================================================
+# =========================================================
+# ERRORS
+# =========================================================
 
 @app.errorhandler(413)
-def upload_too_large(error):
+def too_large(error):
 
-    return (
-        "Upload exceeds MAX_UPLOAD_MB or the hosting platform's "
-        "request-size limit.",
-        413
-    )
+    return "Upload exceeds the configured size limit.", 413
 
 
-@app.errorhandler(503)
-def unavailable(error):
-
-    return str(error.description), 503
-
-
-# ============================================================
+# =========================================================
 # START
-# ============================================================
+# =========================================================
 
 if __name__ == "__main__":
 
